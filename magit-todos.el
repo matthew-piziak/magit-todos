@@ -133,11 +133,29 @@ magit-status buffer.")
   "Whether to show filenames next to to-do items.
 Set automatically depending on grouping.")
 
+(defvar-local magit-todos-updating nil
+  "Whether items are being updated now.")
+
+(defvar-local magit-todos-last-update-time nil
+  "When the items were last updated.
+A time value as returned by `current-time'.")
+
+(defvar-local magit-todos-item-cache nil
+  "Items found by most recent scan.")
+
 ;;;; Customization
 
 (defgroup magit-todos nil
   "Show TODO items in source code comments in repos' files."
   :group 'magit)
+
+(defcustom magit-todos-update t
+  "When or how often to scan for to-dos.
+The list can be updated manually by calling
+`magit-todos-update'."
+  :type '(choice (const :tag "Always" t)
+                 (const :tag "Manually" nil)
+                 (integer :tag "When N seconds have passed since last scanning")))
 
 (defcustom magit-todos-fontify-keyword-headers t
   "Apply keyword faces to group keyword headers."
@@ -401,6 +419,18 @@ used."
       (define-key magit-status-mode-map "jT" nil))
     (remove-hook 'magit-status-sections-hook #'magit-todos--insert-items)))
 
+;;;###autoload
+(defun magit-todos-update ()
+  "Update the to-do list manually.
+Only necessary when `magit-todos-update' is nil."
+  (interactive)
+  (let ((inhibit-read-only t))
+    (magit-todos--delete-section [* todos])
+    ;; HACK: I don't like setting a special var here, because it seems like lexically binding a
+    ;; special var should follow down the chain, but it isn't working, so we'll do this.
+    (setq magit-todos-updating t)
+    (magit-todos--insert-items)))
+
 (defun magit-todos-jump-to-item (&optional peek)
   "Show current item.
 If PEEK is non-nil, keep focus in status buffer window."
@@ -421,6 +451,21 @@ If PEEK is non-nil, keep focus in status buffer window."
   (magit-todos-jump-to-item 'peek))
 
 ;;;; Functions
+
+(defun magit-todos--delete-section (condition)
+  "Delete the section specified by CONDITION from the Magit status buffer.
+See `magit-section-match'."
+  (save-excursion
+    (goto-char (point-min))
+    (when-let ((section (cl-loop until (magit-section-match condition)
+                                 ;; Use `forward-line' instead of `magit-section-forward' because
+                                 ;; sometimes it skips our section.
+                                 do (forward-line 1)
+                                 finally return (magit-current-section))))
+      (with-slots (start end) section
+        ;; NOTE: We delete 1 past the end because we insert a newline after the section.  I'm not
+        ;; sure if this would generalize to all Magit sections.
+        (delete-region start (1+ end))))))
 
 (defun magit-todos--item-buffer (item)
   "Return buffer visiting ITEM."
@@ -451,10 +496,20 @@ This function should be called from inside a ‘magit-status’ buffer."
       (when (buffer-live-p buffer)
         (kill-buffer buffer)))
     (setq magit-todos-active-scan nil))
-  (setq magit-todos-active-scan (funcall magit-todos-scan-fn
-                                         :magit-status-buffer (current-buffer)
-                                         :directory default-directory
-                                         :depth magit-todos-depth)))
+  (if (or magit-todos-updating
+          (pcase magit-todos-update
+            ((pred integerp)
+             (>= (float-time (time-subtract (current-time)
+                                            magit-todos-last-update-time))
+                 magit-todos-update))
+            ('t t)))
+      ;; Scan and insert
+      (setq magit-todos-active-scan (funcall magit-todos-scan-fn
+                                             :magit-status-buffer (current-buffer)
+                                             :directory default-directory
+                                             :depth magit-todos-depth))
+    ;; Use cache
+    (magit-todos--insert-items-callback (current-buffer) magit-todos-item-cache)))
 
 (defun magit-todos--insert-items-callback (magit-status-buffer items)
   "Insert to-do ITEMS into MAGIT-STATUS-BUFFER."
@@ -478,7 +533,16 @@ This function should be called from inside a ‘magit-status’ buffer."
     (when (buffer-live-p magit-status-buffer)
       ;; Don't try to select a killed status buffer
       (with-current-buffer magit-status-buffer
+        (when (or magit-todos-update
+                  magit-todos-updating)
+          ;; Update cache
+          (setq magit-todos-item-cache items)
+          (setq magit-todos-last-update-time (current-time))
+          ;; HACK: I don't like setting this special var, but it works.  See other comment where
+          ;; it's set t.
+          (setq magit-todos-updating nil))
         (save-excursion
+          ;; Insert items
           (goto-char (point-min))
           ;; Go to insertion position
           (pcase magit-todos-insert-at
@@ -488,14 +552,25 @@ This function should be called from inside a ‘magit-status’ buffer."
             ('bottom (goto-char (point-max)))
             (_ (magit-todos--skip-section (vector '* magit-todos-insert-at))))
           ;; Insert section
-          (aprog1
-              (magit-todos--insert-group :type 'todos
-                :heading (format "TODOs (%s)" num-items)
-                :group-fns group-fns
-                :items items
-                :depth 0)
-            (insert "\n")
-            (magit-todos--set-visibility :section it :num-items num-items)))))))
+          (if (not items)
+              (unless magit-todos-update
+                ;; When -update is non-nil, no items means nothing to show.  When nil, show message
+                ;; to indicate updating must be done manually.
+                (let ((magit-insert-section--parent magit-root-section)
+                      (message (if magit-todos-updating
+                                   "0"
+                                 "update manually")))
+                  (magit-insert-section (todos)
+                    (magit-insert-heading (format "TODOs (%s)" message)))
+                  (insert "\n")))
+            (aprog1
+                (magit-todos--insert-group :type 'todos
+                  :heading (format "TODOs (%s)" num-items)
+                  :group-fns group-fns
+                  :items items
+                  :depth 0)
+              (insert "\n")
+              (magit-todos--set-visibility :section it :num-items num-items))))))))
 
 (cl-defun magit-todos--insert-group (&key depth group-fns heading type items)
   "Insert ITEMS into grouped Magit section and return the section.
